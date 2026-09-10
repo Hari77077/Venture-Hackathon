@@ -1,19 +1,27 @@
 // =============================================================================
-// reciever.ino — Flood-mesh Gateway Receiver / UART Bridge Node
+// reciever.ino — Flood-mesh Gateway Receiver / UART Bridge  (Arduino Uno)
 //
 // Hardware:
-//   • MCU    : Arduino Mega / Nano (on Mega: use Serial1 for radio, Serial for PC)
-//   • Radio  : SX1278 LoRa  (NSS=10, DIO0=2, RST=9, DIO1=3)
-//   • UART   : Serial → Gateway (Raspberry Pi / PC)
+//   MCU    : Arduino Uno (ATmega328P)
+//   Radio  : SX1278 LoRa
+//     SCK  = Pin 13   (hardware SPI)
+//     MISO = Pin 12
+//     MOSI = Pin 11
+//     NSS  = Pin 10
+//     RST  = Pin 9
+//     DIO0 = Pin 2    (interrupt 0)
+//   UART   : USB serial → PC running Go backend
 //
-// Role in mesh:
-//   • Passively receives ALL packet types from the mesh
-//   • Forwards every packet to the connected Gateway over UART
-//     (framing: [0xAA][len][MeshPacket bytes])
-//   • Listens for injected packets from the Gateway and broadcasts them
-//   • Does NOT relay packets back into the mesh (it's an edge receiver, not
-//     an interior relay — unlike the Anchor which does both)
-//   • Full Serial debug for every RX/TX event
+// Role:
+//   • Edge receiver: captures ALL mesh packets and bridges to PC via USB serial
+//   • Stamps RSSI/SNR/SF before forwarding
+//   • Accepts injected packets from the PC and broadcasts them into the mesh
+//   • Does NOT relay packets back into the mesh (edge node, not interior relay)
+//
+// NOTE: On Arduino Uno, Serial is shared between debug output and the UART
+// bridge. The Go backend's serial ingest must scan for 0xAA frame markers and
+// skip any debug text. Consider using Arduino Mega with Serial1 for the bridge
+// if this causes issues.
 // =============================================================================
 
 #include <RadioLib.h>
@@ -21,28 +29,26 @@
 #include "../common/radio.h"
 #include "uart_bridge.h"
 
-// ---- Node identity ---------------------------------------------------------
+// ---- Node identity --------------------------------------------------------
 #define MY_NODE_ID   4001U
 
-// ---- Pin assignments -------------------------------------------------------
-#define NSS_PIN   10
-#define DIO0_PIN   2
-#define RST_PIN    9
-#define DIO1_PIN   3
-#define LED_PIN    6
+// ---- Pin assignments (Arduino Uno default SPI) ----------------------------
+#define LORA_NSS     10
+#define LORA_DIO0     2
+#define LORA_RST      9
 
 // ---- UART ------------------------------------------------------------------
 #define UART_BAUD  115200
 
 // ---- Hardware instances ----------------------------------------------------
-SX1278     radioModule = new Module(NSS_PIN, DIO0_PIN, RST_PIN, DIO1_PIN);
+SX1278     radioModule = new Module(LORA_NSS, LORA_DIO0, LORA_RST, RADIOLIB_NC);
 MeshRadio  radio(radioModule);
 UartBridge gateway(Serial);
-SeenCache  seenCache;   // used only for downlink injection dedup
+SeenCache  seenCache;
 
 // ---- State -----------------------------------------------------------------
-bool     radioOk    = false;
-uint32_t rxCount    = 0;
+bool     radioOk       = false;
+uint32_t rxCount       = 0;
 uint32_t lastAdaptSFMs = 0;
 #define ADAPT_SF_INTERVAL_MS  (2UL * 60UL * 1000UL)
 
@@ -52,36 +58,26 @@ void printSepLine();
 // ============================================================================
 void setup() {
     Serial.begin(UART_BAUD);
-    while (!Serial);
 
     printSepLine();
-    Serial.println(F("=== Receiver / UART Bridge Boot ==="));
-    Serial.print(F("  Node ID : "));
-    Serial.println(MY_NODE_ID);
-    Serial.print(F("  Compiled: "));
-    Serial.print(F(__DATE__));
-    Serial.print(F(" "));
-    Serial.println(F(__TIME__));
+    Serial.println(F("=== Receiver / UART Bridge Boot (Uno) ==="));
+    Serial.print(F("  Node ID : ")); Serial.println(MY_NODE_ID);
+    Serial.print(F("  Compiled: ")); Serial.print(F(__DATE__));
+    Serial.print(F(" ")); Serial.println(F(__TIME__));
     printSepLine();
-
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
 
     randomSeed(analogRead(A0));
 
     gateway.begin(UART_BAUD);
-    Serial.println(F("[Setup] UART bridge ready (115200 baud)"));
+    Serial.println(F("[Setup] UART bridge ready"));
 
     radioOk = radio.begin();
     if (!radioOk) {
-        Serial.println(F("[Setup] *** Radio FAILED — halting ***"));
-        while (true) {
-            digitalWrite(LED_PIN, HIGH); delay(150);
-            digitalWrite(LED_PIN, LOW);  delay(150);
-        }
+        Serial.println(F("[Setup] *** Radio FAILED ***"));
+        while (true) { delay(1000); }
     }
 
-    Serial.println(F("[Setup] Boot complete. Bridging mesh → UART."));
+    Serial.println(F("[Setup] Boot complete. Bridging mesh → PC."));
     printSepLine();
 }
 
@@ -90,84 +86,56 @@ void loop() {
     uint32_t now = millis();
 
     // =========================================================
-    // 1. MESH → UART GATEWAY
+    // 1. MESH → PC (via UART)
     // =========================================================
     MeshPacket pkt;
     if (radio.receive(pkt, 0) == RADIOLIB_ERR_NONE) {
         rxCount++;
 
-        // Stamp last-hop link quality so the Gateway sees RF conditions
+        // Stamp link quality
         pkt.rssi_dbm = radio.lastRssi();
         pkt.snr_db   = radio.lastSnr();
         pkt.sf       = radio.currentSF();
 
-        Serial.print(F("[RX] #"));
-        Serial.print(rxCount);
-        Serial.print(F("  origin="));
-        Serial.print(pkt.origin_id);
-        Serial.print(F("  seq="));
-        Serial.print(pkt.seq_num);
-        Serial.print(F("  ttl="));
-        Serial.print(pkt.ttl);
-        Serial.print(F("  type="));
-        Serial.print(pkt.msg_type);
-        Serial.print(F("  node_type="));
-        Serial.print(pkt.node_type);
-        Serial.print(F("  sev="));
-        Serial.print(pkt.severity);
-        Serial.print(F("  P="));
-        Serial.print(pkt.pressure_hpa, 2);
-        Serial.print(F("hPa  T="));
-        Serial.print(pkt.temp_c, 2);
-        Serial.print(F("°C  Vib="));
-        Serial.print(pkt.vibration_g, 3);
-        Serial.print(F("g  RSSI="));
-        Serial.print(pkt.rssi_dbm);
-        Serial.print(F("dBm  SNR="));
-        Serial.print(pkt.snr_db);
-        Serial.print(F("dB  SF="));
-        Serial.println(pkt.sf);
+        Serial.print(F("[RX] #")); Serial.print(rxCount);
+        Serial.print(F("  origin=")); Serial.print(pkt.origin_id);
+        Serial.print(F("  seq=")); Serial.print(pkt.seq_num);
+        Serial.print(F("  ttl=")); Serial.print(pkt.ttl);
+        Serial.print(F("  type=")); Serial.print(pkt.msg_type);
+        Serial.print(F("  node=")); Serial.print(pkt.node_type);
+        Serial.print(F("  sev=")); Serial.print(pkt.severity);
+        Serial.print(F("  P=")); Serial.print(pkt.pressure_hpa, 2);
+        Serial.print(F("  T=")); Serial.print(pkt.temp_c, 2);
+        Serial.print(F("  H=")); Serial.print(pkt.humidity_pct, 1);
+        Serial.print(F("  Vib=")); Serial.print(pkt.vibration_g, 3);
+        Serial.print(F("  WL=")); Serial.print(pkt.water_level_cm, 1);
+        Serial.print(F("  RSSI=")); Serial.print(pkt.rssi_dbm);
+        Serial.print(F("  SNR=")); Serial.print(pkt.snr_db);
+        Serial.print(F("  SF=")); Serial.println(pkt.sf);
 
         if (pkt.msg_type == MSG_TEXT) {
             pkt.message[MSG_TEXT_LEN - 1] = '\0';
-            Serial.print(F("[RX] MSG_TEXT: \""));
-            Serial.print(pkt.message);
-            Serial.println(F("\""));
+            Serial.print(F("[RX] MSG: \"")); Serial.print(pkt.message); Serial.println(F("\""));
         }
 
-        // Bridge to Gateway (no dedup — the Gateway handles that)
+        // Bridge to PC
         gateway.sendToGateway(pkt);
-        Serial.println(F("[Bridge] Sent to Gateway via UART"));
-
-        // LED blink on each bridged packet
-        digitalWrite(LED_PIN, HIGH);
-        delay(10);
-        digitalWrite(LED_PIN, LOW);
     }
 
     // =========================================================
-    // 2. GATEWAY → MESH INJECTION (alerts / text from server)
+    // 2. PC → MESH INJECTION
     // =========================================================
     MeshPacket inject;
     if (gateway.pollFromGateway(inject)) {
         inject.node_type = NODE_RECEIVER;
         inject.ttl       = MAX_TTL;
 
-        Serial.print(F("[GW→Mesh] Injecting  type="));
-        Serial.print(inject.msg_type);
-        Serial.print(F("  sev="));
-        Serial.println(inject.severity);
-
-        if (inject.msg_type == MSG_TEXT) {
-            inject.message[MSG_TEXT_LEN - 1] = '\0';
-            Serial.print(F("[GW→Mesh] Text: \""));
-            Serial.print(inject.message);
-            Serial.println(F("\""));
-        }
+        Serial.print(F("[PC→Mesh] type=")); Serial.print(inject.msg_type);
+        Serial.print(F("  sev=")); Serial.println(inject.severity);
 
         seenCache.add(inject.origin_id, inject.seq_num);
         bool ok = radio.sendWithCAD(inject);
-        Serial.println(ok ? F("[GW→Mesh] Injected OK") : F("[GW→Mesh] Inject FAILED"));
+        Serial.println(ok ? F("[PC→Mesh] OK") : F("[PC→Mesh] FAILED"));
     }
 
     // =========================================================
