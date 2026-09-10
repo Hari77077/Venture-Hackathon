@@ -1,0 +1,69 @@
+# ChromaDB / vector store
+db/
+*.sqlite3
+*.pickle
+
+# Large raster / binary dataset files
+*.grd
+*.zip
+*.gz
+*.tar
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+.venv
+venv/
+env/
+
+# Go
+*.exe
+*.exe~
+*.test
+*.out
+vendor/
+
+# Node / JS
+node_modules/
+npm-debug.log*
+
+# Arduino build artefacts
+*.elf
+*.hex
+*.bin
+*.map
+build/
+
+# ML model weights & large datasets
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+*.pkl
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Secrets / keys
+*.pem
+*.key
+.env.local
